@@ -1,21 +1,16 @@
-"""
-Employee Attendance & Analytics API
-Built with FastAPI & MongoDB (PyMongo)
-"""
 import calendar
 import os
 from contextlib import asynccontextmanager
 from datetime import date as dt_date
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, status
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 from pymongo import MongoClient, ReturnDocument
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -29,15 +24,12 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def init_indexes():
-    """Create all required indexes idempotently at startup."""
     try:
-        # employees indexes
         db.employees.create_index([("emp_code", 1)], unique=True, name="idx_emp_code_unique")
         db.employees.create_index([("department", 1), ("emp_code", 1)], name="idx_emp_dept_code")
         db.employees.create_index([("joined_on", 1)], name="idx_emp_joined_on")
         db.employees.create_index([("department", 1), ("joined_on", 1)], name="idx_emp_dept_joined")
 
-        # attendance_logs indexes
         db.attendance_logs.create_index(
             [("emp_code", 1), ("date", 1)], unique=True, name="idx_att_emp_date_unique"
         )
@@ -54,7 +46,6 @@ def init_indexes():
             [("emp_code", 1), ("punch_in", -1)], name="idx_att_emp_punch_in_desc"
         )
     except Exception as e:
-        # Log index creation warning if DB is not reachable yet at import time
         print(f"Warning initializing indexes: {e}")
 
 
@@ -71,17 +62,12 @@ app = FastAPI(
 )
 
 
-# --------------------------------------------------------------------------- #
-# Math & Conversion Helpers
-# --------------------------------------------------------------------------- #
 def round_half_up(val: float | Decimal, decimals: int = 2) -> float:
-    """Standard arithmetic half-up rounding (R4, R8)."""
     d = Decimal(str(val))
     return float(d.quantize(Decimal(10) ** -decimals, rounding=ROUND_HALF_UP))
 
 
 def dt_to_epoch_ms(dt: Optional[datetime]) -> Optional[int]:
-    """Convert UTC or naive datetime to epoch milliseconds."""
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -90,7 +76,6 @@ def dt_to_epoch_ms(dt: Optional[datetime]) -> Optional[int]:
 
 
 def epoch_ms_to_dt(ms: Optional[int]) -> Optional[datetime]:
-    """Convert epoch milliseconds to UTC datetime, truncated to whole seconds (R1)."""
     if ms is None:
         return None
     sec = ms // 1000
@@ -103,11 +88,6 @@ def parse_hh_mm(s: str) -> tuple[int, int]:
 
 
 def get_attendance_date(punch_dt_utc: datetime, shift_start: str, shift_end: str) -> str:
-    """
-    R1: Attendance date is IST calendar date of punch_in.
-    Overnight shift exception (shift_end <= shift_start): punch-in earlier than
-    shift_end (in IST time) belongs to previous day's shift.
-    """
     punch_ist = punch_dt_utc.astimezone(IST)
     p_time = punch_ist.time()
     s_end_time = time(*parse_hh_mm(shift_end))
@@ -124,11 +104,6 @@ def get_attendance_date(punch_dt_utc: datetime, shift_start: str, shift_end: str
 def compute_late_minutes(
     punch_in_utc: datetime, shift_start: str, shift_end: str, attendance_date_str: str
 ) -> int:
-    """
-    R2: Grace period 10 minutes.
-    Late only if punch-in strictly > 10:00 after shift_start.
-    Then whole minutes (floor) since shift_start, not grace period.
-    """
     att_date = dt_date.fromisoformat(attendance_date_str)
     start_h, start_m = parse_hh_mm(shift_start)
     shift_start_ist = datetime.combine(att_date, time(start_h, start_m), tzinfo=IST)
@@ -141,7 +116,6 @@ def compute_late_minutes(
 
 
 def compute_work_hours(punch_in_utc: datetime, punch_out_utc: datetime) -> float:
-    """R4: (punch_out - punch_in) in seconds / 3600, rounded to 2 decimals half-up."""
     diff_sec = (punch_out_utc - punch_in_utc).total_seconds()
     hours = diff_sec / 3600.0
     return round_half_up(hours, 2)
@@ -150,10 +124,6 @@ def compute_work_hours(punch_in_utc: datetime, punch_out_utc: datetime) -> float
 def compute_overtime(
     punch_out_utc: datetime, shift_start: str, shift_end: str, attendance_date_str: str
 ) -> int:
-    """
-    R3: Whole minutes (floor) from shift_end to punch_out, counted only if >= 30; else 0.
-    Overnight shifts: shift_end falls on next calendar day.
-    """
     att_date = dt_date.fromisoformat(attendance_date_str)
     end_h, end_m = parse_hh_mm(shift_end)
     start_h, start_m = parse_hh_mm(shift_start)
@@ -164,7 +134,7 @@ def compute_overtime(
 
     punch_out_ist = punch_out_utc.astimezone(IST)
     diff_sec = (punch_out_ist - shift_end_ist).total_seconds()
-    if diff_sec >= 1800:  # 30 minutes
+    if diff_sec >= 1800:
         return int(diff_sec // 60)
     return 0
 
@@ -208,9 +178,6 @@ def format_attendance_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# --------------------------------------------------------------------------- #
-# Pydantic Schemas
-# --------------------------------------------------------------------------- #
 class EmployeeCreate(BaseModel):
     emp_code: str = Field(..., pattern=r"^EMP\d{4,6}$")
     name: str = Field(..., min_length=1, max_length=100)
@@ -240,12 +207,8 @@ class RegularizeRequest(BaseModel):
     regularized_by: str = Field(..., min_length=1, max_length=50)
 
 
-# --------------------------------------------------------------------------- #
-# Endpoints
-# --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
-    """Readiness probe. Returns 200 only if MongoDB answers a ping, otherwise 503."""
     try:
         client.admin.command("ping")
         return {"status": "ok"}
@@ -278,8 +241,8 @@ def create_employee(body: EmployeeCreate):
 @app.get("/employees")
 def list_employees(
     department: Optional[str] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
 ):
     q = {}
     if department:
@@ -349,7 +312,6 @@ def punch_out(body: PunchOutRequest):
         now_sec = int(datetime.now(timezone.utc).timestamp())
         out_dt = datetime.fromtimestamp(now_sec, tz=timezone.utc)
 
-    # Find most recent record with punch_in <= punched_at
     candidate = db.attendance_logs.find_one(
         {"emp_code": body.emp_code, "punch_in": {"$lte": out_dt, "$ne": None}},
         sort=[("punch_in", -1)],
@@ -380,7 +342,6 @@ def punch_out(body: PunchOutRequest):
     )
     half_day = work_hours < 4.50
 
-    # Atomic update to prevent race conditions on simultaneous punch-outs
     updated = db.attendance_logs.find_one_and_update(
         {
             "emp_code": candidate["emp_code"],
@@ -409,8 +370,8 @@ def list_attendance(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     status: Optional[str] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
 ):
     if date_from and date_to and date_from > date_to:
         raise HTTPException(
@@ -522,7 +483,6 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
             new_in, emp["shift_start"], emp["shift_end"], date
         )
 
-    # Detect field differences
     changes = {}
     if new_status != old_status:
         changes["status"] = {"from": old_status, "to": new_status}
@@ -552,7 +512,6 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
         "changes": changes,
     }
 
-    # Atomic update with history length match to prevent silent history loss
     existing_history = rec.get("history", [])
     updated = db.attendance_logs.find_one_and_update(
         {
@@ -580,11 +539,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
     return format_attendance_doc(updated)
 
 
-# --------------------------------------------------------------------------- #
-# Analytics Pipelines
-# --------------------------------------------------------------------------- #
 def count_working_days(joined_on: str, month: str) -> int:
-    """R7: Mon-Fri working days in the month from joined_on for mid-month joiners."""
     y, m = map(int, month.split("-"))
     num_days = calendar.monthrange(y, m)[1]
     month_end_date = dt_date(y, m, num_days)
@@ -599,14 +554,17 @@ def count_working_days(joined_on: str, month: str) -> int:
     count = 0
     curr = effective_start
     while curr <= month_end_date:
-        if curr.weekday() < 5:  # Mon-Fri
+        if curr.weekday() < 5:
             count += 1
         curr += timedelta(days=1)
     return count
 
 
 @app.get("/analytics/employees/{emp_code}/monthly")
-def employee_monthly(emp_code: str, month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$")):
+def employee_monthly(
+    emp_code: str,
+    month: Annotated[str, Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")],
+):
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
@@ -691,7 +649,7 @@ def employee_monthly(emp_code: str, month: str = Query(..., pattern=r"^\d{4}-(0[
 
 @app.get("/analytics/departments/summary")
 def department_summary(
-    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    month: Annotated[str, Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")],
     department: Optional[str] = None,
 ):
     y, m = map(int, month.split("-"))
@@ -837,8 +795,8 @@ def department_summary(
 
 @app.get("/analytics/leaderboard/late")
 def late_leaderboard(
-    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
-    limit: int = Query(10, ge=1, le=50),
+    month: Annotated[str, Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")],
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
     department: Optional[str] = None,
 ):
     y, m = map(int, month.split("-"))
@@ -874,7 +832,6 @@ def late_leaderboard(
     if department:
         pipeline.append({"$match": {"emp.department": department}})
 
-    # Standard competition ranking using window functions (1, 2, 2, 4)
     pipeline.extend([
         {
             "$setWindowFields": {
@@ -906,8 +863,8 @@ def late_leaderboard(
 @app.get("/analytics/departments/{department}/trend")
 def department_trend(
     department: str,
-    from_date: str = Query(..., alias="from", pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    to_date: str = Query(..., alias="to", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    from_date: Annotated[str, Query(alias="from", pattern=r"^\d{4}-\d{2}-\d{2}$")],
+    to_date: Annotated[str, Query(alias="to", pattern=r"^\d{4}-\d{2}-\d{2}$")],
 ):
     d_from = dt_date.fromisoformat(from_date)
     d_to = dt_date.fromisoformat(to_date)
@@ -1083,9 +1040,6 @@ def department_trend(
     return {"department": department, "items": items}
 
 
-# --------------------------------------------------------------------------- #
-# Admin Explain Endpoint (Part C)
-# --------------------------------------------------------------------------- #
 @app.get("/admin/explain/{endpoint}")
 def explain_endpoint(
     endpoint: str,
@@ -1096,8 +1050,8 @@ def explain_endpoint(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     status: Optional[str] = None,
-    from_date: Optional[str] = Query(None, alias="from"),
-    to_date: Optional[str] = Query(None, alias="to"),
+    from_date: Annotated[Optional[str], Query(alias="from")] = None,
+    to_date: Annotated[Optional[str], Query(alias="to")] = None,
     page: int = 1,
     page_size: int = 20,
 ):
