@@ -925,16 +925,12 @@ def department_trend(
     if not dept_emps:
         raise HTTPException(status_code=404, detail="Department not found")
 
-    # Generate all calendar days in range for trend
-    curr = d_from
-    calendar_days = []
-    while curr <= d_to:
-        calendar_days.append(curr)
-        curr += timedelta(days=1)
+    d_from_dt = datetime.combine(d_from, time.min, tzinfo=timezone.utc)
+    d_to_dt_bound = datetime.combine(d_to + timedelta(days=1), time.min, tzinfo=timezone.utc)
 
     emp_codes = [e["emp_code"] for e in dept_emps]
+    joined_dates = [e["joined_on"] for e in dept_emps]
 
-    # Pre-aggregate logs in the date range
     pipeline = [
         {
             "$match": {
@@ -959,46 +955,128 @@ def department_trend(
                 },
             }
         },
+        {
+            "$project": {
+                "date_val": {"$dateFromString": {"dateString": "$_id"}},
+                "date": "$_id",
+                "present_count": 1,
+                "late_count": 1,
+            }
+        },
+        {
+            "$unionWith": {
+                "pipeline": [
+                    {
+                        "$documents": [
+                            {
+                                "date_val": d_from_dt,
+                                "date": from_date,
+                                "present_count": 0.0,
+                                "late_count": 0,
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        {
+            "$group": {
+                "_id": "$date_val",
+                "date": {"$first": "$date"},
+                "present_count": {"$sum": "$present_count"},
+                "late_count": {"$sum": "$late_count"},
+            }
+        },
+        {
+            "$project": {
+                "date_val": "$_id",
+                "date": 1,
+                "present_count": 1,
+                "late_count": 1,
+            }
+        },
+        {
+            "$densify": {
+                "field": "date_val",
+                "range": {
+                    "step": 1,
+                    "unit": "day",
+                    "bounds": [d_from_dt, d_to_dt_bound],
+                },
+            }
+        },
+        {
+            "$project": {
+                "date": {
+                    "$ifNull": [
+                        "$date",
+                        {"$dateToString": {"format": "%Y-%m-%d", "date": "$date_val"}},
+                    ]
+                },
+                "date_val": 1,
+                "present_count": {"$ifNull": ["$present_count", 0.0]},
+                "late_count": {"$ifNull": ["$late_count", 0]},
+                "is_working_day": {
+                    "$in": [{"$dayOfWeek": "$date_val"}, [2, 3, 4, 5, 6]]
+                },
+            }
+        },
+        {
+            "$addFields": {
+                "headcount": {
+                    "$size": {
+                        "$filter": {
+                            "input": joined_dates,
+                            "as": "j",
+                            "cond": {"$lte": ["$$j", "$date"]},
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "$addFields": {
+                "attendance_rate": {
+                    "$cond": [
+                        {
+                            "$and": [
+                                {"$eq": ["$is_working_day", True]},
+                                {"$gt": ["$headcount", 0]},
+                            ]
+                        },
+                        {"$divide": ["$present_count", "$headcount"]},
+                        None,
+                    ]
+                }
+            }
+        },
+        {"$sort": {"date_val": 1}},
+        {
+            "$setWindowFields": {
+                "sortBy": {"date_val": 1},
+                "output": {
+                    "moving_avg_7d": {
+                        "$avg": "$attendance_rate",
+                        "window": {"documents": [-6, "current"]},
+                    }
+                },
+            }
+        },
     ]
 
-    day_stats = {d["_id"]: d for d in db.attendance_logs.aggregate(pipeline)}
-
-    rates_history: List[Optional[float]] = []
     items = []
-
-    for c_date in calendar_days:
-        iso_str = c_date.isoformat()
-        is_working_day = c_date.weekday() < 5
-        headcount = sum(1 for e in dept_emps if e["joined_on"] <= iso_str)
-
-        stat = day_stats.get(iso_str, {})
-        present_count = float(stat.get("present_count", 0.0))
-        late_count = int(stat.get("late_count", 0))
-
-        if is_working_day and headcount > 0:
-            rate = round_half_up(present_count / headcount, 4)
-        else:
-            rate = None
-
-        rates_history.append(rate)
-
-        # 7-day moving average of non-null rates inside range window (up to 6 preceding + current)
-        window = rates_history[-7:]
-        valid_rates = [r for r in window if r is not None]
-        if valid_rates:
-            moving_avg = round_half_up(sum(valid_rates) / len(valid_rates), 4)
-        else:
-            moving_avg = None
-
+    for doc in db.attendance_logs.aggregate(pipeline):
+        rate = doc.get("attendance_rate")
+        m_avg = doc.get("moving_avg_7d")
         items.append(
             {
-                "date": iso_str,
-                "is_working_day": is_working_day,
-                "headcount": headcount,
-                "present_count": present_count,
-                "late_count": late_count,
-                "attendance_rate": rate,
-                "moving_avg_7d": moving_avg,
+                "date": doc["date"],
+                "is_working_day": bool(doc["is_working_day"]),
+                "headcount": int(doc["headcount"]),
+                "present_count": float(doc["present_count"]),
+                "late_count": int(doc["late_count"]),
+                "attendance_rate": round_half_up(rate, 4) if rate is not None else None,
+                "moving_avg_7d": round_half_up(m_avg, 4) if m_avg is not None else None,
             }
         )
 
@@ -1041,7 +1119,7 @@ def explain_endpoint(
             .sort([("date", -1), ("emp_code", 1)])
             .skip(skip)
             .limit(page_size)
-            .explain("executionStats")
+            .explain()
         )
         return {"endpoint": endpoint, "collection": "attendance_logs", "explain": plan}
 
